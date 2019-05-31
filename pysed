@@ -1,0 +1,41 @@
+#!/bin/env python3
+
+import argparse
+import fileinput
+import re
+import sys
+
+def go(pattern, replace, verbose, overwrite, philes):
+    rx = re.compile(pattern)
+
+    def do_replace(line):
+        return rx.sub(replace, line)
+    def do_search(line):
+        return line if rx.search(line) else None
+
+    op = do_search if replace is None else do_replace
+
+    for line in fileinput.input(files=philes, inplace=overwrite):
+        result = op(line)
+        if result is not None:
+            prefix = "%s:%d" % (fileinput.filename(), fileinput.filelineno()) if verbose else ""
+            print(prefix + result, end="")
+
+def main(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--pattern', '-p', help='pattern string', type=str, default=r'^')
+    parser.add_argument('--replace', '-r', help='replace string', type=str, default=None)
+    parser.add_argument('--overwrite', '-x', help='overwrite existing file',
+                        default=False, action='store_true')
+    parser.add_argument('--verbose', '-v', help='verbose output',
+                        default=False, action='store_true')
+
+    parser.add_argument('files', help='input files', nargs='*', default=[])
+    args = parser.parse_args(argv[1:])
+
+    go(args.pattern, args.replace, args.verbose, args.overwrite, args.files)
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
