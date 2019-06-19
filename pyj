@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+
+import argparse
+import csv
+import itertools
+import json
+import math
+import os
+import re
+import string
+import sys
+import time
+from ast import literal_eval
+from collections import defaultdict, namedtuple
+from operator import itemgetter
+from urllib.parse import unquote
+
+"""A swiss-army knife for text querying:
+
+* JSON and CSV input formats
+* Map/filter operations, provided as python3 expressions
+* Group-by/aggregate operations, using arbitrary python functions (len, sum, max, etc.)
+* Join operations
+
+Example query:
+
+Healthy storage nodes, aggregated by datacenter
+pyj -f en.json -q "(datacenter, 1) if service_role=='STORAGE_NODE' and health_state=='HEALTHY'" -a sum -k 0 -v 1
+"""
+
+RECORD_ALIAS = '_'
+
+"""An aggregate consists of:
+1) A non-empty list of aggregate functions (e.g., sum, average, percentile(.5))
+2) A list of key columns indexes; this list can be empty.
+3) A single value column index.
+"""
+Aggregate = namedtuple('Aggregate', ['funcs', 'key_columns', 'value_column'])
+
+"""
+Sort information:
+1) A non-empty list of sort column indexes
+2) Reverse (True/False)
+"""
+OrderBy = namedtuple('OrderBy', ['columns', 'reverse'])
+
+def sanitize_key(key):
+    """Convert an arbitray string to a legal python identifier."""
+    return re.sub('\W|^(?=\d)','_', key)
+
+class BunchDict(dict):
+    """A dictionary whose keys are also bound as object attributes.
+
+    Dictionary keys are first sanitized into legal python identifers.  Therefore,
+    the following expressions are equivalent:
+
+    _['My-Attribute'] == My_Attribute
+    """
+
+    def __init__(self, dictionary):
+        dict.__init__(self, dictionary)
+
+        def flatten(value):
+            if isinstance(value, dict):
+                return BunchDict(value)
+            else:
+                return value
+
+        self.__dict__.update({sanitize_key(k): flatten(v) for k,v in dictionary.items()})
+
+def pretty_time(millis_since_epoch):
+    tm = time.gmtime(millis_since_epoch // 1000)
+    return time.strftime("%Y-%m-%d %H:%M", tm)
+
+def bbjson(s):
+    """Convert a BigBird string into a JSON object."""
+    return BunchDict(json.loads(unquote(s)))
+
+def percentile(p):
+    """Return a function that computes a percentile statistic over a list of numbers.
+
+    For example, percentile(.5) returns the median function.
+    """
+    assert 1.0 > p >= 0.0
+
+    def __p1(ls):
+        k = math.floor(len(ls) * p)
+        assert k >= 0
+        assert k < len(ls)
+
+        start = 0
+        end = len(ls) - 1
+
+        while start <= end:
+            pivot_index = start
+            pivot_val = ls[pivot_index]
+
+            for i in range(pivot_index + 1, end + 1):
+                if ls[i] >= pivot_val:
+                    continue
+                else:
+                    ls[pivot_index] = ls[i]
+                    pivot_index += 1
+                    ls[i] = ls[pivot_index]
+
+            ls[pivot_index] = pivot_val
+            if pivot_index == k:
+                return pivot_val
+            elif pivot_index > k:
+                end = pivot_index - 1
+            else:
+                start = pivot_index + 1
+
+        return ls[start]
+
+    return __p1
+
+def average(ls):
+    """Compute the average of a list of numbers."""
+
+    if len(ls) == 0:
+        return 0.0
+
+    sm = sum(ls)
+    return sm / len(ls)
+
+def display(out_fh, obj_out, compact):
+    """Pretty-print an object.
+
+    :param out_fh: File-like object to write to
+    :param obj_out: The object to write
+    :param compact: Whether to use compact (one line) output for JSON output
+    """
+    if isinstance(obj_out, dict):
+        indent = None if compact else 4
+        json.dump(obj_out, out_fh, sort_keys=True, indent=indent)
+        out_fh.write("\n")
+    elif isinstance(obj_out, tuple):
+        out_fh.write(','.join(str(x) for x in obj_out) + "\n")
+    else:
+        out_fh.write(str(obj_out) + "\n")
+
+class JsonRecordReader(object):
+    """Reads json records into a python dictionary."""
+    def __init__(self, default_obj):
+        self.default_obj = default_obj
+
+    def get_record(self, line):
+        obj = dict(self.default_obj)
+        obj.update(json.loads(line))
+        bunch = BunchDict(obj)
+
+        env = {RECORD_ALIAS: bunch}
+        env.update(bunch.__dict__)
+        env.update(globals())
+
+        return obj, env
+
+def typeify(s):
+    """Try to convert a string into a more appropriate type (int, float, etc.)"""
+    try:
+        return literal_eval(s)
+    except:
+        return s
+
+class CsvRecordReader(object):
+    """Reads CSV records into python lists."""
+    def __init__(self):
+        self.ls = []
+        self.reader = csv.reader(self.ls)
+
+    def get_record(self, line):
+        self.ls.append(line)
+        for row in self.reader:
+            # Convert strings to a more appropriate type
+            typed_row = tuple([typeify(x) for x in row])
+            env = {RECORD_ALIAS: typed_row}
+            env.update(globals())
+            return typed_row, env
+
+class MetaRecordReader(object):
+    """A record reader that switches from JSON to CSV according to its input."""
+
+    def __init__(self, default_obj):
+        self.reader = JsonRecordReader(default_obj)
+
+    def get_record(self, line):
+        while True:
+            try:
+                return self.reader.get_record(line)
+            except:
+                if isinstance(self.reader, JsonRecordReader):
+                    self.reader = CsvRecordReader()
+                else:
+                    sys.stderr.write("Unable to parse input line: %s\n" % line)
+                    raise
+
+def map(query, fh, skip_header_row, default_obj={}):
+    """Map a user-provided query expression over a set of JSON objects.
+
+    The query is executed for every JSON object in the input file.  The JSON object
+    is bound to the special variable '_'.  In addition, all JSON attributes appear
+    in the global namespace for the query expression.
+
+    :param query: A string containine a python expression
+    :param fh: A file-like object to read from
+    :param skip_header_row: If True, the first row is ignored.
+    :param default_obj: A dictionary containing default attribute values.
+    :return: An iterator of objects, as returned by the query.
+    """
+
+    # First, try the JsonRecordReader; then attempt the csv record reader
+    reader = MetaRecordReader(default_obj)
+
+    # Hack: append an 'else []' to queries that lack an else clause
+    if " if " in query and not " else " in query:
+        query = query + " else []"
+
+    compiled_query = compile(query, 'STRING', 'eval')
+
+    it = iter(fh)
+    if skip_header_row:
+        next(it)
+
+    for line in it:
+        obj, env = reader.get_record(line)
+        obj_out = eval(compiled_query, env)
+        if isinstance(obj_out, list):
+            # Lists are treated as flatmap
+            yield from obj_out
+        else:
+            yield obj_out
+
+def join_op(it1, it2):
+    """Join two streams of tuples.
+
+    The join key is the first column of both input streams.  All columns are retained
+    in the output stream, except the equijoin column is retained only once.
+
+    :param it1: The first tuple iterator
+    :param it2: The second tuple iterator
+    :return: A tuple iterator containing joined tuples.
+    """
+
+    d = defaultdict(list)
+    for tpl in it1:
+        d[tpl[0]].append(tpl)
+    for tpl in it2:
+        matches = d[tpl[0]]
+        for match in matches:
+            yield match + tpl[1:]
+
+def aggregate_op(it, agg):
+    """Compute an aggregate over an input stream.
+
+    :param it: A stream of input objects
+    :param agg: An Aggregate object
+    :return: An iterator over an aggregated stream of tuples.
+    """
+    key_func = lambda tpl: tuple(tpl[idx] for idx in agg.key_columns)
+
+    d = defaultdict(list)
+    for tpl in it:
+        key = key_func(tpl)
+        val = tpl[agg.value_column]
+        d[key].append(val)
+
+    # Reduce the list of values into a single tuple per aggregate key:
+    for key, values in d.items():
+        agg_results = tuple([func(values) for func in agg.funcs])
+        yield key + agg_results
+
+def distinct_op(it):
+    """Distinct operator implementation."""
+    s = set(it)
+    return iter(s)
+
+def run_query(queries, files, default_obj, skip_header, agg, distinct, order_by, limit):
+    """Execute a series of query expressions.
+
+    1) Evalue each query over its corresponding input file.
+    2) If there are two inputs, join the results together.
+    3) If an aggregate is provided, aggregate the results.
+    4) If distinct is True, retain one copy of each input.
+    5) If order_by is provided, sort the results based on the given columns.
+    6) If limit is provided, return a prefix of the result.
+
+    :param queries: A list of strings containing user-provided query expressions.
+    :param files: A list of input files; one file per input query.
+    :param default_obj: A dictonary of default JSON attribute values
+    :param skip_header: If True, skip the first input line.
+    :param agg: An optional Aggregate object.
+    :param distinct: If true, retain one copy of each input.
+    :param order_by: An optional OrderBy object.
+    :param limit: An integer limit on the output size, or zero for no limit.
+
+    :return: An iterator of output objects.
+    """
+    its = [map(query, phile, skip_header, default_obj) for (query, phile) in zip(queries, files)]
+    it = its[0]
+    if len(its) == 2:
+        it = join_op(*its)
+
+    if agg is not None:
+        it = aggregate_op(it, agg)
+
+    if distinct:
+        it = distinct_op(it)
+
+    if order_by is not None:
+        it = iter(sorted(it, key=itemgetter(*order_by.columns), reverse=order_by.reverse))
+
+    if limit > 0:
+        it = itertools.islice(it, limit)
+
+    return it
+
+def main(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--queries', '-q', nargs='+', help='query string', type=str, default=[RECORD_ALIAS])
+    parser.add_argument('--files', '-f', nargs='+', help="input file", type=argparse.FileType('r'), default=[sys.stdin])
+
+    parser.add_argument('--compact', '-c', dest='compact', help='compact output', action='store_true')
+    parser.add_argument('--skip_header', '-s', help='skip header row', action='store_true')
+
+    parser.add_argument('--default', '-i', help='default JSON values', default='{}')
+    parser.add_argument('--distinct', '-d', help='distinct operator', action='store_true')
+
+    parser.add_argument('--agg_funcs', '-a', help='aggregate functions', nargs='+')
+    parser.add_argument('--key_columns', '-k', help='aggregate key columns', type=int, default=[], nargs='+')
+    parser.add_argument('--value_column', '-v', help='aggregate value column', type=int, default=0)
+
+    parser.add_argument('--order_by_columns', '-o', help='order by columns', nargs='+', type=int)
+    parser.add_argument('--reverse', '-r', help='sort in descending order', action='store_true')
+    parser.add_argument('--limit', '-l', help='limit operator', type=int, default=0) # no limit
+
+    args = parser.parse_args(argv[1:])
+
+    if len(args.queries) != len(args.files):
+        sys.stderr.write("Number of queries must match number of input files\n")
+        sys.exit(1)
+
+    if len(args.files) > 2:
+        sys.stderr.write("At most two input files are supported\n")
+        sys.exit(1)
+
+    aggregate = None
+    if args.agg_funcs is not None:
+        funcs = [eval(arg) for arg in args.agg_funcs]
+        aggregate = Aggregate(funcs, args.key_columns, args.value_column)
+
+    order_by = None
+    if args.order_by_columns is not None:
+        order_by = OrderBy(args.order_by_columns, args.reverse)
+
+    default_obj = json.loads(args.default)
+
+    it = run_query(args.queries, args.files, default_obj, args.skip_header, aggregate,
+                   args.distinct, order_by, args.limit)
+
+    for obj in it:
+        display(sys.stdout, obj, args.compact)
+
+if __name__ == '__main__':
+    main(sys.argv)
